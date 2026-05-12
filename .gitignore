@@ -1,0 +1,15 @@
+# Go
+bin/
+*.exe
+*.test
+*.out
+cover.out
+
+# Rust
+target/
+Cargo.lock
+
+# Node runtime data
+data/
+*.log
+.DS_Store

@@ -1,0 +1,11 @@
+node_id: node-0001
+listen_addr: 0.0.0.0:8080
+data_dir: ./data
+api_addr: 0.0.0.0:8090
+bootstrap_peers:
+  - http://127.0.0.1:8081
+  - http://127.0.0.1:8082
+region_quorum: 2
+snapshot_every_events: 128
+max_pull_batch: 512
+max_push_batch: 512
