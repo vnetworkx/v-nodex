@@ -2,7 +2,6 @@ package main
 
 import (
 	"flag"
-	"fmt"
 	"log"
 
 	"vnodex/internal/config"
@@ -10,22 +9,27 @@ import (
 )
 
 func main() {
-	var configPath string
-	flag.StringVar(&configPath, "config", "", "path to YAML config")
+	configPath := flag.String(
+		"config",
+		"../../configs/node.example.yaml",
+		"path to config file",
+	)
+
 	flag.Parse()
 
-	cfg, err := config.Load(configPath)
+	cfg, err := config.Load(*configPath)
 	if err != nil {
-		log.Fatalf("load config: %v", err)
+		log.Fatal(err)
 	}
 
 	n, err := node.New(cfg)
 	if err != nil {
-		log.Fatalf("create node: %v", err)
+		log.Fatal(err)
 	}
 
-	fmt.Printf("v-nodex node %s listening on %s\n", cfg.NodeID, cfg.ListenAddr)
+	log.Printf("starting vnodex node: %s", cfg.NodeID)
+
 	if err := n.Run(); err != nil {
-		log.Fatalf("run node: %v", err)
+		log.Fatal(err)
 	}
 }

@@ -1,0 +1,34 @@
+node_id: node-0001
+
+# HTTP control/query interfaces
+listen_addr: 0.0.0.0:18080
+api_addr: 0.0.0.0:18090
+
+# Real libp2p QUIC listeners
+p2p_listen_addrs:
+  - /ip4/0.0.0.0/udp/19000/quic-v1
+
+# Empty until real bootstrap peers exist
+bootstrap_peers: []
+
+# Persistent storage
+data_dir: ./data/node-0001
+
+# Consensus/sync
+region_quorum: 2
+snapshot_every_events: 1024
+max_pull_batch: 512
+max_push_batch: 512
+
+# Future production additions
+enable_metrics: true
+metrics_addr: 0.0.0.0:19100
+
+enable_debug_routes: false
+
+event_max_size_bytes: 1048576
+
+peer_connect_timeout_seconds: 10
+sync_interval_seconds: 5
+
+max_concurrent_syncs: 32
