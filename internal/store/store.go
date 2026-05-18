@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"vnodex/internal/dag"
 	"vnodex/internal/model"
 )
 
@@ -112,8 +113,13 @@ func (s *Store) loadEvents() error {
 		if err := json.Unmarshal(b, &event); err != nil {
 			return err
 		}
+		if event.EventHash == "" {
+			return fmt.Errorf("event file %s has empty event_hash", path)
+		}
+		if _, exists := s.events[event.EventHash]; exists {
+			return fmt.Errorf("duplicate event hash loaded from disk: %s", event.EventHash)
+		}
 		s.events[event.EventHash] = event
-		s.ordered = append(s.ordered, event.EventHash)
 		return nil
 	})
 }
@@ -140,35 +146,54 @@ func (s *Store) loadSnapshots() error {
 func (s *Store) Rebuild() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.state = model.LiveState{Entities: map[string]model.EntityState{}, Regions: map[string]model.RegionState{}, Heads: map[string]string{}}
-	ordered := make([]model.Event, 0, len(s.events))
-	for _, e := range s.events {
-		ordered = append(ordered, e)
+
+	graph, err := dag.NewFromEvents(s.events)
+	if err != nil {
+		return err
 	}
-	sort.SliceStable(ordered, func(i, j int) bool {
-		if !ordered[i].TimeCreated.Equal(ordered[j].TimeCreated) {
-			return ordered[i].TimeCreated.Before(ordered[j].TimeCreated)
-		}
-		if ordered[i].LogicalOrder != ordered[j].LogicalOrder {
-			return ordered[i].LogicalOrder < ordered[j].LogicalOrder
-		}
-		return ordered[i].EventHash < ordered[j].EventHash
-	})
+	ordered, err := graph.TopoOrder()
+	if err != nil {
+		return err
+	}
+
+	nextState := model.LiveState{
+		Entities: make(map[string]model.EntityState),
+		Regions:  make(map[string]model.RegionState),
+		Heads:    make(map[string]string),
+	}
+
 	for _, e := range ordered {
-		if err := s.applyEventLocked(e); err != nil {
+		if err := applyEventToState(&nextState, e); err != nil {
 			return err
 		}
 	}
+
+	s.state = nextState
+	s.ordered = make([]string, 0, len(ordered))
+	for _, e := range ordered {
+		s.ordered = append(s.ordered, e.EventHash)
+	}
+
 	return s.persistLiveStateLocked()
 }
 
 func (s *Store) Append(event model.Event) (model.Event, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	if event.TimeCreated.IsZero() {
 		event.TimeCreated = time.Now().UTC()
 	}
+	event.TimeCreated = event.TimeCreated.UTC().Round(0)
 	event.Metadata = model.CanonicalizeMetadata(event.Metadata)
+	event.ParentHashes = canonicalizeStringSlice(event.ParentHashes)
+	event.InputVector = canonicalizeVector(event.InputVector)
+	event.OutputVector = canonicalizeVector(event.OutputVector)
+	event.DirectionBefore = canonicalizeVector(event.DirectionBefore)
+	event.DirectionAfter = canonicalizeVector(event.DirectionAfter)
+	event.SpaceCoordinatesBefore = canonicalizeVector(event.SpaceCoordinatesBefore)
+	event.SpaceCoordinatesAfter = canonicalizeVector(event.SpaceCoordinatesAfter)
+
 	computedHash, _, err := model.CanonicalEventHash(event.EventCore)
 	if err != nil {
 		return model.Event{}, err
@@ -182,78 +207,156 @@ func (s *Store) Append(event model.Event) (model.Event, error) {
 	if err := model.ValidateEvent(event); err != nil {
 		return model.Event{}, err
 	}
+
 	if _, exists := s.events[event.EventHash]; exists {
 		return event, nil
 	}
-	if err := s.applyEventLocked(event); err != nil {
+
+	for _, parent := range event.ParentHashes {
+		if parent == "" {
+			return model.Event{}, errors.New("parent hash cannot be empty")
+		}
+		if _, ok := s.events[parent]; !ok {
+			return model.Event{}, fmt.Errorf("missing parent event %s", parent)
+		}
+	}
+
+	testEvents := make(map[string]model.Event, len(s.events)+1)
+	for k, v := range s.events {
+		testEvents[k] = v
+	}
+	testEvents[event.EventHash] = event
+
+	graph, err := dag.NewFromEvents(testEvents)
+	if err != nil {
 		return model.Event{}, err
 	}
+	ordered, err := graph.TopoOrder()
+	if err != nil {
+		return model.Event{}, err
+	}
+
+	nextState := model.LiveState{
+		Entities: make(map[string]model.EntityState),
+		Regions:  make(map[string]model.RegionState),
+		Heads:    make(map[string]string),
+	}
+	for _, e := range ordered {
+		if err := applyEventToState(&nextState, e); err != nil {
+			return model.Event{}, err
+		}
+	}
+
 	if err := s.persistEventLocked(event); err != nil {
 		return model.Event{}, err
 	}
-	s.events[event.EventHash] = event
-	s.ordered = append(s.ordered, event.EventHash)
+
+	s.events = testEvents
+	s.state = nextState
+	s.ordered = make([]string, 0, len(ordered))
+	for _, e := range ordered {
+		s.ordered = append(s.ordered, e.EventHash)
+	}
+
 	if err := s.persistLiveStateLocked(); err != nil {
 		return model.Event{}, err
 	}
+
 	return event, nil
 }
 
-func (s *Store) applyEventLocked(event model.Event) error {
-	if event.ParentIDs != nil {
-		for _, pid := range event.ParentIDs {
-			if pid == "" {
-				continue
-			}
-			if _, ok := s.events[pid]; !ok {
-				return fmt.Errorf("missing parent event %s", pid)
-			}
+func applyEventToState(state *model.LiveState, event model.Event) error {
+	if state.Entities == nil {
+		state.Entities = make(map[string]model.EntityState)
+	}
+	if state.Regions == nil {
+		state.Regions = make(map[string]model.RegionState)
+	}
+	if state.Heads == nil {
+		state.Heads = make(map[string]string)
+	}
+
+	state.SpaceID = event.SpaceID
+
+	entity := state.Entities[event.EntityID]
+	if entity.EntityID == "" {
+		entity = model.EntityState{
+			EntityID:   event.EntityID,
+			SpaceID:    event.SpaceID,
+			RegionID:   event.RegionID,
+			VectorType: event.VectorType,
+			Metadata:   []model.KeyValue{},
 		}
 	}
-	entity := s.state.Entities[event.EntityID]
-	if entity.EntityID == "" {
-		entity = model.EntityState{EntityID: event.EntityID, SpaceID: event.SpaceID, RegionID: event.RegionID, VectorType: event.VectorType, Metadata: []model.KeyValue{}}
-	}
+
 	before := entity.Vector.Clone()
 	after := applyOperation(before, event)
+
 	entity.SpaceID = event.SpaceID
 	entity.RegionID = event.RegionID
 	entity.VectorType = event.VectorType
-	entity.Position = entity.Position.Clone()
+
 	if len(event.SpaceCoordinatesAfter) > 0 {
 		entity.Position = event.SpaceCoordinatesAfter.Clone()
 	}
+
 	if len(event.OutputVector) > 0 {
 		entity.Vector = event.OutputVector.Clone()
 	} else {
 		entity.Vector = after.Clone()
 	}
-	if len(event.InputVector) > 0 && event.Operation == model.OpTransfer && event.TargetEntityID != "" {
-		target := s.state.Entities[event.TargetEntityID]
-		if target.EntityID == "" {
-			target = model.EntityState{EntityID: event.TargetEntityID, SpaceID: event.SpaceID, RegionID: event.RegionID, VectorType: event.VectorType, Metadata: []model.KeyValue{}}
-		}
-		target.Vector = target.Vector.Add(event.OutputVector)
-		target.SpaceID = event.SpaceID
-		target.RegionID = event.RegionID
-		s.state.Entities[event.TargetEntityID] = target
-	}
+
 	entity.Velocity = entity.Vector.Sub(before)
 	entity.Certified = event.Certified
 	entity.LastEventHash = event.EventHash
 	entity.LastLogicalOrder = event.LogicalOrder
-	s.state.Entities[event.EntityID] = entity
+	state.Entities[event.EntityID] = entity
 
-	region := s.state.Regions[event.RegionID]
+	region := state.Regions[event.RegionID]
 	region.RegionID = event.RegionID
 	region.SpaceID = event.SpaceID
 	region.EventHashes = appendUnique(region.EventHashes, event.EventHash)
 	region.EntityIDs = appendUnique(region.EntityIDs, event.EntityID)
 	region.LogicalHeight = max64(region.LogicalHeight, event.LogicalOrder)
-	s.state.Regions[event.RegionID] = region
-	s.state.Heads[event.EntityID] = event.EventHash
-	s.state.LatestHash = event.EventHash
-	s.state.LatestOrder = max64(s.state.LatestOrder, event.LogicalOrder)
+	state.Regions[event.RegionID] = region
+
+	state.Heads[event.EntityID] = event.EventHash
+
+	if event.Operation == model.OpTransfer && event.TargetEntityID != "" {
+		target := state.Entities[event.TargetEntityID]
+		if target.EntityID == "" {
+			target = model.EntityState{
+				EntityID:   event.TargetEntityID,
+				SpaceID:    event.SpaceID,
+				RegionID:   event.RegionID,
+				VectorType: event.VectorType,
+				Metadata:   []model.KeyValue{},
+			}
+		}
+
+		targetBefore := target.Vector.Clone()
+		sent := event.OutputVector
+		if len(sent) == 0 {
+			sent = event.InputVector.Clone()
+		}
+		if len(sent) > 0 {
+			target.Vector = target.Vector.Add(sent)
+		}
+		target.SpaceID = event.SpaceID
+		target.RegionID = event.RegionID
+		target.VectorType = event.VectorType
+		target.Velocity = target.Vector.Sub(targetBefore)
+		target.Certified = event.Certified
+		target.LastEventHash = event.EventHash
+		target.LastLogicalOrder = event.LogicalOrder
+		state.Entities[event.TargetEntityID] = target
+		state.Heads[event.TargetEntityID] = event.EventHash
+		region.EntityIDs = appendUnique(region.EntityIDs, event.TargetEntityID)
+		state.Regions[event.RegionID] = region
+	}
+
+	state.LatestHash = event.EventHash
+	state.LatestOrder = max64(state.LatestOrder, event.LogicalOrder)
 	return nil
 }
 
@@ -271,6 +374,8 @@ func applyOperation(before model.Vector, event model.Event) model.Vector {
 	case model.OpProject:
 		return event.OutputVector.Clone()
 	case model.OpReconstruct, model.OpQuery, model.OpRecord:
+		return before
+	case model.OpMove:
 		return before
 	case model.OpAdd, model.OpCompose:
 		return before.Add(event.InputVector)
@@ -365,35 +470,49 @@ func (s *Store) Region(regionID string) (model.RegionState, bool) {
 func (s *Store) Snapshot(scope string) (model.Snapshot, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	snap := model.Snapshot{
-		SnapshotID: fmt.Sprintf("snap-%d-%s", time.Now().UTC().UnixNano(), shortHash(scope)),
-		SpaceID:    s.state.SpaceID,
-		Scope:      scope,
-		RootHash:   s.state.LatestHash,
-		EventHash:  s.state.LatestHash,
-		StateRoot:  cloneState(s.state),
-		CreatedAt:  time.Now().UTC(),
-		Sealed:     true,
+		SnapshotID:    fmt.Sprintf("snap-%d-%s", time.Now().UTC().UnixNano(), shortHash(scope)),
+		SpaceID:       s.state.SpaceID,
+		Scope:         scope,
+		RootHash:      hashState(s.state),
+		EventHash:     s.state.LatestHash,
+		StateRootHash: hashState(s.state),
+		Heads:         cloneStringMap(s.state.Heads),
+		LogicalOrder:  s.state.LatestOrder,
+		CreatedAt:     time.Now().UTC(),
+		Sealed:        true,
 	}
-	snap.StateRoot.Snapshot = &snap
+
 	path := filepath.Join(s.root, "snapshots", snap.SnapshotID+".json")
 	if err := writeJSONAtomic(path, snap); err != nil {
 		return model.Snapshot{}, err
 	}
+
 	s.snapshots = append(s.snapshots, snap)
+	s.state.Snapshot = &snap
+
 	if region, ok := s.state.Regions[scope]; ok {
 		region.SnapshotHash = snap.SnapshotID
 		s.state.Regions[scope] = region
 		_ = s.persistLiveStateLocked()
 	}
+
 	return snap, nil
 }
 
 func (s *Store) Snapshots() []model.Snapshot {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+
 	out := make([]model.Snapshot, len(s.snapshots))
 	copy(out, s.snapshots)
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].CreatedAt.Before(out[j].CreatedAt)
+		}
+		return out[i].SnapshotID < out[j].SnapshotID
+	})
 	return out
 }
 
@@ -459,8 +578,6 @@ func cloneState(in model.LiveState) model.LiveState {
 	for k, v := range in.Heads {
 		out.Heads[k] = v
 	}
-	// Snapshot pointers are intentionally not deep-copied into persisted cache state
-	// to avoid recursive serialization cycles.
 	out.Snapshot = nil
 	return out
 }
@@ -482,6 +599,44 @@ func cloneRegion(in model.RegionState) model.RegionState {
 	out.EventHashes = append([]string(nil), in.EventHashes...)
 	out.NeighborRegionHashes = append([]string(nil), in.NeighborRegionHashes...)
 	return out
+}
+
+func cloneStringMap(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return map[string]string{}
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func hashState(state model.LiveState) string {
+	copied := cloneState(state)
+	copied.Snapshot = nil
+	b, err := json.Marshal(copied)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+func canonicalizeStringSlice(in []string) []string {
+	if len(in) == 0 {
+		return []string{}
+	}
+	out := append([]string(nil), in...)
+	sort.Strings(out)
+	return out
+}
+
+func canonicalizeVector(v model.Vector) model.Vector {
+	if v == nil {
+		return model.Vector{}
+	}
+	return v
 }
 
 func writeJSONAtomic(path string, v any) error {
