@@ -1,0 +1,21 @@
+node_id: node-0001
+listen_addr: 0.0.0.0:18080
+api_addr: 0.0.0.0:18090
+kernel_url: http://127.0.0.1:18180
+data_dir: ./data/node-0001
+bootstrap_peers:
+  - http://127.0.0.1:18090
+p2p_listen_addrs:
+  - /ip4/0.0.0.0/tcp/19000
+region_quorum: 2
+snapshot_every_events: 1024
+max_pull_batch: 512
+max_push_batch: 512
+enable_metrics: true
+metrics_addr: 0.0.0.0:19100
+enable_debug_routes: false
+event_max_size_bytes: 1048576
+peer_connect_timeout_seconds: 10
+sync_interval_seconds: 5
+max_concurrent_syncs: 32
+request_timeout_seconds: 15

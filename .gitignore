@@ -1,0 +1,9 @@
+/bin/
+/dist/
+/tmp/
+/data/
+/.vscode/
+*.log
+*.sqlite
+*.db
+*.zip

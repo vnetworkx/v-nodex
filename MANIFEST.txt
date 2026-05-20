@@ -1,0 +1,10 @@
+v-nodex rebuilt repository
+- Go node runtime
+- HTTP server
+- file-backed append-only storage
+- kernel bridge client
+- deterministic replay and DAG verification
+- snapshot manager
+- sync scaffold
+- CLI tooling
+- docs, SQL schema, Docker assets, and tests

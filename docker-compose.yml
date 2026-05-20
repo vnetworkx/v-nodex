@@ -1,0 +1,27 @@
+services:
+  node:
+    build:
+      context: .
+      dockerfile: services/node/Dockerfile
+    environment:
+      - VNODEX_CONFIG=/etc/vnodex/node.yaml
+    volumes:
+      - ./configs/node.yaml:/etc/vnodex/node.yaml:ro
+      - ./data:/var/lib/vnodex
+    ports:
+      - "18080:18080"
+      - "18090:18090"
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    environment:
+      - VNODEX_CONFIG=/etc/vnodex/node.yaml
+    volumes:
+      - ./configs/node.yaml:/etc/vnodex/node.yaml:ro
+      - ./data:/var/lib/vnodex
+    ports:
+      - "18180:18090"
+    restart: unless-stopped
